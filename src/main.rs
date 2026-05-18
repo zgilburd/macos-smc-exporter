@@ -1,4 +1,5 @@
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use smc::{SMC, SMCError};
 use tiny_http::{Header, Response, Server, StatusCode};
 
@@ -26,11 +27,23 @@ struct PowerMetricsResult {
     thermal_pressure: String,
 }
 
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn fcc_to_str(code: u32) -> String {
     let bytes = code.to_be_bytes();
     String::from_utf8_lossy(&bytes).to_string()
 }
 
+#[cfg(not(target_os = "macos"))]
+fn run_smc() -> SMCResult {
+    eprintln!("run_smc: stubbed on non-macOS targets");
+    SMCResult {
+        sensors: vec![],
+        total_keys: 0,
+        readable_keys: 0,
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn run_smc() -> SMCResult {
     let smc = match SMC::shared() {
         Ok(s) => s,
@@ -162,9 +175,22 @@ fn run_smc() -> SMCResult {
     }
 }
 
+fn empty_power_result() -> PowerMetricsResult {
+    PowerMetricsResult {
+        cpu_power_mw: 0.0,
+        gpu_power_mw: 0.0,
+        ane_power_mw: 0.0,
+        combined_power_mw: 0.0,
+        gpu_freq_hz: 0.0,
+        gpu_idle_ratio: 0.0,
+        thermal_pressure: "Unknown".to_string(),
+    }
+}
+
 fn run_powermetrics() -> PowerMetricsResult {
-    let output = std::process::Command::new("sudo")
+    let output = match std::process::Command::new("sudo")
         .args([
+            "-n",
             "powermetrics",
             "--samplers",
             "gpu_power,cpu_power,thermal",
@@ -178,64 +204,84 @@ fn run_powermetrics() -> PowerMetricsResult {
             "plist",
         ])
         .output()
-        .expect("Failed to run powermetrics");
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Failed to run powermetrics: {}", e);
+            return empty_power_result();
+        }
+    };
 
     if !output.status.success() {
-        return PowerMetricsResult {
-            cpu_power_mw: 0.0,
-            gpu_power_mw: 0.0,
-            ane_power_mw: 0.0,
-            combined_power_mw: 0.0,
-            gpu_freq_hz: 0.0,
-            gpu_idle_ratio: 0.0,
-            thermal_pressure: "Unknown".to_string(),
-        };
+        eprintln!(
+            "powermetrics exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return empty_power_result();
     }
 
-    let tmp = "/tmp/pm.plist";
-    std::fs::write(tmp, &output.stdout).expect("Failed to write plist temp");
+    parse_powermetrics_plist(&output.stdout)
+}
 
-    let py_output = std::process::Command::new("python3")
-        .args([
-            "-c",
-            "import sys,plistlib,json; d=plistlib.load(open(sys.argv[1],'rb')); p=d.get('processor',{}); g=d.get('gpu',{}); print(json.dumps({'cpu_power':p.get('cpu_power',0),'gpu_power':p.get('gpu_power',0),'ane_power':p.get('ane_power',0),'combined_power':p.get('combined_power',0),'freq_hz':g.get('freq_hz',0),'idle_ratio':g.get('idle_ratio',0),'thermal_pressure':d.get('thermal_pressure','Unknown')}))",
-            tmp,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .expect("Failed to run python plist parser");
+fn parse_powermetrics_plist(bytes: &[u8]) -> PowerMetricsResult {
+    let root = match plist::Value::from_reader(std::io::Cursor::new(bytes)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Failed to parse powermetrics plist: {}", e);
+            return empty_power_result();
+        }
+    };
 
-    if !py_output.status.success() {
-        eprintln!("Python plist parse failed: {}", String::from_utf8_lossy(&py_output.stderr));
-        return PowerMetricsResult {
-            cpu_power_mw: 0.0,
-            gpu_power_mw: 0.0,
-            ane_power_mw: 0.0,
-            combined_power_mw: 0.0,
-            gpu_freq_hz: 0.0,
-            gpu_idle_ratio: 0.0,
-            thermal_pressure: "Unknown".to_string(),
-        };
+    let top = match root.as_dictionary() {
+        Some(d) => d,
+        None => {
+            eprintln!("powermetrics plist root is not a dictionary");
+            return empty_power_result();
+        }
+    };
+
+    fn plist_f64(v: &plist::Value) -> Option<f64> {
+        v.as_real()
+            .or_else(|| v.as_signed_integer().map(|i| i as f64))
+            .or_else(|| v.as_unsigned_integer().map(|u| u as f64))
     }
 
-    let json_str = String::from_utf8_lossy(&py_output.stdout);
-    let vals: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_else(|_| {
-        eprintln!("Failed to parse python output: {}", json_str);
-        serde_json::json!({})
-    });
+    fn get_f64(top: &plist::Dictionary, path: &[&str]) -> f64 {
+        let mut cur = match top.get(path[0]) {
+            Some(v) => v,
+            None => return 0.0,
+        };
+        for key in &path[1..] {
+            let next = cur.as_dictionary().and_then(|d| d.get(*key));
+            cur = match next {
+                Some(v) => v,
+                None => return 0.0,
+            };
+        }
+        plist_f64(cur).unwrap_or(0.0)
+    }
 
-    let to_f64 = |k: &str| vals.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let to_str = |k: &str| vals.get(k).and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+    fn get_str(top: &plist::Dictionary, key: &str) -> String {
+        top.get(key)
+            .and_then(|v| v.as_string())
+            .unwrap_or("Unknown")
+            .to_string()
+    }
 
+    // Unit notes (verified empirically against `powermetrics --format plist` on M3 Ultra):
+    //   processor.cpu_power / gpu_power / ane_power / combined_power: already mW
+    //   gpu.freq_hz: actually MHz despite the field name (e.g. ~776.3 at idle)
+    //   gpu.idle_ratio: a 0–1 fraction
+    // Also note: `gpu_power` lives under `processor`, not under `gpu`.
     PowerMetricsResult {
-        cpu_power_mw: (to_f64("cpu_power") * 1000.0).round(),
-        gpu_power_mw: (to_f64("gpu_power") * 1000.0).round(),
-        ane_power_mw: (to_f64("ane_power") * 1000.0).round(),
-        combined_power_mw: (to_f64("combined_power") * 1000.0).round(),
-        gpu_freq_hz: (to_f64("freq_hz") * 1_000_000_000.0).round(),
-        gpu_idle_ratio: (to_f64("idle_ratio") * 100.0).round(),
-        thermal_pressure: to_str("thermal_pressure"),
+        cpu_power_mw: get_f64(top, &["processor", "cpu_power"]).round(),
+        gpu_power_mw: get_f64(top, &["processor", "gpu_power"]).round(),
+        ane_power_mw: get_f64(top, &["processor", "ane_power"]).round(),
+        combined_power_mw: get_f64(top, &["processor", "combined_power"]).round(),
+        gpu_freq_hz: (get_f64(top, &["gpu", "freq_hz"]) * 1_000_000.0).round(),
+        gpu_idle_ratio: (get_f64(top, &["gpu", "idle_ratio"]) * 100.0).round(),
+        thermal_pressure: get_str(top, "thermal_pressure"),
     }
 }
 
@@ -273,7 +319,12 @@ fn generate_metrics(smc: &SMCResult, pm: &PowerMetricsResult) -> String {
             sensor.key, sensor.temp_c
         ));
     }
+    out.push_str("# HELP macos_smc_total_keys Total number of SMC temperature keys scanned\n");
+    out.push_str("# TYPE macos_smc_total_keys gauge\n");
     out.push_str(&format!("macos_smc_total_keys {}\n", smc.total_keys));
+
+    out.push_str("# HELP macos_smc_readable_keys Number of SMC temperature keys successfully read\n");
+    out.push_str("# TYPE macos_smc_readable_keys gauge\n");
     out.push_str(&format!("macos_smc_readable_keys {}\n", smc.readable_keys));
 
     // Power metrics
@@ -330,7 +381,12 @@ fn main() {
     if server_mode {
         // HTTP server mode — run as a daemon
         let server = Server::http("0.0.0.0:9100").expect("Failed to start HTTP server on :9100");
-        eprintln!("smc-reader: serving /metrics on :9100 (mode={})", mode);
+        let metrics_header = Header::from_bytes(
+            b"Content-Type",
+            b"text/plain; version=0.0.4; charset=utf-8",
+        )
+        .expect("static Content-Type header is valid");
+        eprintln!("macos-smc-exporter: serving /metrics on :9100 (mode={})", mode);
 
         for request in server.incoming_requests() {
             if request.url() == "/metrics" {
@@ -347,21 +403,12 @@ fn main() {
                 let pm = if mode == "powermetrics" || mode == "both" {
                     run_powermetrics()
                 } else {
-                    PowerMetricsResult {
-                        cpu_power_mw: 0.0,
-                        gpu_power_mw: 0.0,
-                        ane_power_mw: 0.0,
-                        combined_power_mw: 0.0,
-                        gpu_freq_hz: 0.0,
-                        gpu_idle_ratio: 0.0,
-                        thermal_pressure: "Unknown".to_string(),
-                    }
+                    empty_power_result()
                 };
 
                 let metrics = generate_metrics(&smc, &pm);
-                let header = Header::from_bytes(b"Content-Type", b"text/plain; version=0.0.4; charset=utf-8").unwrap();
                 let response = Response::from_string(metrics)
-                    .with_header(header)
+                    .with_header(metrics_header.clone())
                     .with_status_code(StatusCode(200));
                 let _ = request.respond(response);
             } else if request.url() == "/health" {
@@ -393,18 +440,7 @@ fn main() {
                     let out = generate_metrics(s, p);
                     print!("{}", out);
                 } else {
-                    let out = generate_metrics(
-                        s,
-                        &PowerMetricsResult {
-                            cpu_power_mw: 0.0,
-                            gpu_power_mw: 0.0,
-                            ane_power_mw: 0.0,
-                            combined_power_mw: 0.0,
-                            gpu_freq_hz: 0.0,
-                            gpu_idle_ratio: 0.0,
-                            thermal_pressure: "Unknown".to_string(),
-                        },
-                    );
+                    let out = generate_metrics(s, &empty_power_result());
                     print!("{}", out);
                 }
             }
@@ -430,22 +466,214 @@ fn main() {
             if let Some(s) = smc {
                 output.insert(
                     "smc".to_string(),
-                    serde_json::Value::Object(
-                        serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap(),
-                    ),
+                    serde_json::to_value(&s).expect("SMCResult serializes"),
                 );
             }
             if let Some(p) = pm {
                 output.insert(
                     "powermetrics".to_string(),
-                    serde_json::Value::Object(
-                        serde_json::from_value(serde_json::to_value(p).unwrap()).unwrap(),
-                    ),
+                    serde_json::to_value(&p).expect("PowerMetricsResult serializes"),
                 );
             }
-            let json = serde_json::to_string_pretty(&output).unwrap();
+            let json = serde_json::to_string_pretty(&output)
+                .expect("Map<String, Value> serializes");
             eprintln!("{}", json);
             push_to_vm(&json, url);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Shape mirrors real `powermetrics --format plist` output on M3 Ultra:
+    // gpu_power lives under `processor` (not `gpu`), and power fields are mW.
+    const PLIST_HAPPY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>processor</key>
+    <dict>
+        <key>cpu_power</key><real>993.156</real>
+        <key>gpu_power</key><real>476.674</real>
+        <key>ane_power</key><real>0.0</real>
+        <key>combined_power</key><real>1469.83</real>
+    </dict>
+    <key>gpu</key>
+    <dict>
+        <key>freq_hz</key><real>776.3</real>
+        <key>idle_ratio</key><real>0.777314</real>
+    </dict>
+    <key>thermal_pressure</key><string>Nominal</string>
+</dict>
+</plist>"#;
+
+    const PLIST_EMPTY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict/>
+</plist>"#;
+
+    #[test]
+    fn parse_powermetrics_plist_happy_path() {
+        let r = parse_powermetrics_plist(PLIST_HAPPY);
+        assert_eq!(r.cpu_power_mw, 993.0);
+        assert_eq!(r.gpu_power_mw, 477.0);
+        assert_eq!(r.ane_power_mw, 0.0);
+        assert_eq!(r.combined_power_mw, 1470.0);
+        assert_eq!(r.gpu_freq_hz, 776_300_000.0);
+        assert_eq!(r.gpu_idle_ratio, 78.0);
+        assert_eq!(r.thermal_pressure, "Nominal");
+    }
+
+    #[test]
+    fn parse_powermetrics_plist_missing_keys() {
+        let r = parse_powermetrics_plist(PLIST_EMPTY);
+        let z = empty_power_result();
+        assert_eq!(r.cpu_power_mw, z.cpu_power_mw);
+        assert_eq!(r.gpu_power_mw, z.gpu_power_mw);
+        assert_eq!(r.ane_power_mw, z.ane_power_mw);
+        assert_eq!(r.combined_power_mw, z.combined_power_mw);
+        assert_eq!(r.gpu_freq_hz, z.gpu_freq_hz);
+        assert_eq!(r.gpu_idle_ratio, z.gpu_idle_ratio);
+        assert_eq!(r.thermal_pressure, z.thermal_pressure);
+    }
+
+    #[test]
+    fn parse_powermetrics_plist_malformed() {
+        let r = parse_powermetrics_plist(b"not a plist");
+        assert_eq!(r.cpu_power_mw, 0.0);
+        assert_eq!(r.thermal_pressure, "Unknown");
+    }
+
+    #[test]
+    fn generate_metrics_emits_all_expected_series() {
+        let smc = SMCResult {
+            sensors: vec![
+                SensorReading { key: "TC0C".to_string(), temp_c: 42.5 },
+                SensorReading { key: "TG1D".to_string(), temp_c: 55.0 },
+            ],
+            total_keys: 99,
+            readable_keys: 3,
+        };
+        let pm = PowerMetricsResult {
+            cpu_power_mw: 5500.0,
+            gpu_power_mw: 4000.0,
+            ane_power_mw: 100.0,
+            combined_power_mw: 9600.0,
+            gpu_freq_hz: 1_500_000_000.0,
+            gpu_idle_ratio: 75.0,
+            thermal_pressure: "Nominal".to_string(),
+        };
+        let out = generate_metrics(&smc, &pm);
+        for name in [
+            "macos_smc_temperature_c",
+            "macos_smc_total_keys",
+            "macos_smc_readable_keys",
+            "macos_cpu_power_mw",
+            "macos_gpu_power_mw",
+            "macos_ane_power_mw",
+            "macos_combined_power_mw",
+            "macos_gpu_frequency_hz",
+            "macos_gpu_idle_ratio_percent",
+            "macos_thermal_pressure_level",
+        ] {
+            assert!(out.contains(name), "missing metric {} in output", name);
+            assert!(
+                out.contains(&format!("# TYPE {} gauge", name)),
+                "missing TYPE line for {}",
+                name,
+            );
+            assert!(
+                out.contains(&format!("# HELP {} ", name)),
+                "missing HELP line for {}",
+                name,
+            );
+        }
+        assert!(out.contains("macos_smc_temperature_c{key=\"TC0C\"} 42.5"));
+        assert!(out.contains("macos_smc_total_keys 99"));
+        assert!(out.contains("macos_smc_readable_keys 3"));
+    }
+
+    #[test]
+    fn generate_metrics_thermal_pressure_mapping() {
+        let cases = [
+            ("Nominal", 0.0),
+            ("Light", 1.0),
+            ("Moderate", 2.0),
+            ("Heavy", 3.0),
+            ("Bogus", -1.0),
+            ("Unknown", -1.0),
+        ];
+        for (label, expected) in cases {
+            let pm = PowerMetricsResult {
+                thermal_pressure: label.to_string(),
+                ..empty_power_result()
+            };
+            let smc = SMCResult { sensors: vec![], total_keys: 0, readable_keys: 0 };
+            let out = generate_metrics(&smc, &pm);
+            assert!(
+                out.contains(&format!("macos_thermal_pressure_level {}", expected)),
+                "thermal_pressure {:?} should map to {}",
+                label, expected,
+            );
+        }
+    }
+
+    #[test]
+    fn generate_metrics_sensor_label_naive_escaping() {
+        // SMC keys are 4 ASCII chars in practice so this documents
+        // current (naive) interpolation rather than fixing it.
+        let smc = SMCResult {
+            sensors: vec![SensorReading {
+                key: "T\"X".to_string(),
+                temp_c: 1.0,
+            }],
+            total_keys: 1,
+            readable_keys: 1,
+        };
+        let out = generate_metrics(&smc, &empty_power_result());
+        assert!(out.contains("key=\"T\"X\""));
+    }
+
+    #[test]
+    fn fcc_to_str_roundtrip() {
+        // 'TC1C' = 0x54_43_31_43
+        assert_eq!(fcc_to_str(0x54433143), "TC1C");
+    }
+
+    #[test]
+    fn json_summary_structure() {
+        let smc = SMCResult {
+            sensors: vec![SensorReading { key: "TC0C".to_string(), temp_c: 42.0 }],
+            total_keys: 1,
+            readable_keys: 1,
+        };
+        let pm = PowerMetricsResult {
+            cpu_power_mw: 1000.0,
+            gpu_power_mw: 2000.0,
+            ane_power_mw: 0.0,
+            combined_power_mw: 3000.0,
+            gpu_freq_hz: 1_000_000_000.0,
+            gpu_idle_ratio: 50.0,
+            thermal_pressure: "Light".to_string(),
+        };
+        let mut output = serde_json::Map::new();
+        output.insert(
+            "smc".to_string(),
+            serde_json::to_value(&smc).expect("SMCResult serializes"),
+        );
+        output.insert(
+            "powermetrics".to_string(),
+            serde_json::to_value(&pm).expect("PowerMetricsResult serializes"),
+        );
+        let json = serde_json::to_string_pretty(&output)
+            .expect("Map<String, Value> serializes");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("round-trip");
+        assert!(parsed["smc"]["sensors"].is_array());
+        assert_eq!(parsed["smc"]["sensors"][0]["key"], "TC0C");
+        assert!(parsed["powermetrics"]["cpu_power_mw"].is_number());
+        assert_eq!(parsed["powermetrics"]["thermal_pressure"], "Light");
     }
 }

@@ -26,23 +26,31 @@ Rust binary that reads Apple SMC (System Management Controller) temperature sens
 
 ### HTTP Server Mode (default when no VM URL given)
 ```bash
-smc-reader both
+macos-smc-exporter both
 # Serves /metrics on http://localhost:9100
 # /health for health check
 ```
 
 ### CLI Mode (one-shot, outputs to stdout)
 ```bash
-smc-reader both https://vm.3pac.net/api/v1/write
+macos-smc-exporter both https://vm.3pac.net/api/v1/write
 # Outputs Prometheus format to stdout
 # JSON summary + push result to stderr
 ```
 
 ### Selective Mode
 ```bash
-smc-reader smc       # SMC temps only
-smc-reader powermetrics  # Power metrics only
+macos-smc-exporter smc       # SMC temps only
+macos-smc-exporter powermetrics  # Power metrics only
 ```
+
+### Privileges
+`powermetrics` requires root. The exporter invokes it via `sudo -n` (non-interactive),
+so any mode that includes `powermetrics` (i.e. `powermetrics` or `both`) must be run
+as root or with passwordless sudo configured for the `powermetrics` binary. The
+launchd daemon below runs in the system domain (root) so this is satisfied for the
+daemon path; manual CLI invocations as non-root will log a sudo failure and emit
+zero-filled power metrics rather than hang on a password prompt.
 
 ## Building
 
@@ -57,20 +65,20 @@ cargo build --release
 cargo build --release
 
 # Install binary
-sudo cp target/release/smc-reader /usr/local/bin/smc-reader
-sudo chmod +x /usr/local/bin/smc-reader
+sudo cp target/release/macos-smc-exporter /usr/local/bin/macos-smc-exporter
+sudo chmod +x /usr/local/bin/macos-smc-exporter
 
 # Create launchd service
-sudo tee /Library/LaunchDaemons/com.zgilburd.smc-reader.plist > /dev/null << 'EOF'
+sudo tee /Library/LaunchDaemons/com.zgilburd.macos-smc-exporter.plist > /dev/null << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.zgilburd.smc-reader</string>
+    <string>com.zgilburd.macos-smc-exporter</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/smc-reader</string>
+        <string>/usr/local/bin/macos-smc-exporter</string>
         <string>both</string>
     </array>
     <key>RunAtLoad</key>
@@ -78,19 +86,52 @@ sudo tee /Library/LaunchDaemons/com.zgilburd.smc-reader.plist > /dev/null << 'EO
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/smc-reader.stdout.log</string>
+    <string>/tmp/macos-smc-exporter.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/smc-reader.stderr.log</string>
+    <string>/tmp/macos-smc-exporter.stderr.log</string>
 </dict>
 </plist>
 EOF
 
 # Load service
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.zgilburd.smc-reader.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.zgilburd.macos-smc-exporter.plist
 
 # Verify
 curl -s http://localhost:9100/metrics
 ```
+
+## Migrating from `smc-reader`
+
+If a previous version was installed under the `smc-reader` name, the running
+launchd daemon will still reference `/usr/local/bin/smc-reader` and
+`com.zgilburd.smc-reader`. Swap to the new binary like this:
+
+```bash
+# 1. Confirm what's currently running and where it points
+sudo launchctl list | grep -i smc
+sudo plutil -p /Library/LaunchDaemons/com.zgilburd.smc-reader.plist
+
+# 2. Build the new binary on the target Mac (not cross-compiled)
+cargo build --release
+
+# 3. Stop and unload the old daemon
+sudo launchctl bootout system/com.zgilburd.smc-reader
+
+# 4. Remove the old artifacts
+sudo rm -f /usr/local/bin/smc-reader
+sudo rm -f /Library/LaunchDaemons/com.zgilburd.smc-reader.plist
+sudo rm -f /tmp/pm.plist /tmp/smc-reader.stdout.log /tmp/smc-reader.stderr.log
+
+# 5. Install the new binary + plist using the steps in "Installation on macOS" above.
+
+# 6. Verify the new daemon is up and serving metrics with the new HELP/TYPE lines
+curl -s http://localhost:9100/metrics | grep -E '^# (HELP|TYPE) macos_smc_(total|readable)_keys'
+curl -s http://localhost:9100/metrics | grep -E '^macos_(cpu|gpu)_power_mw '
+```
+
+If the existing plist is custom, the minimal-change path is: keep your plist,
+update its `ProgramArguments` path and `Label` to the new names, then
+`launchctl bootout`/`bootstrap` it.
 
 ## Grafana Alloy Integration
 
@@ -114,12 +155,12 @@ prometheus.scrape "macos" {
 
 ### Power Metrics
 - Uses `powermetrics --samplers gpu_power,cpu_power,thermal -A -n 1 -i 2000 --show-extra-power-info --format plist`
-- Parses the XML plist via Python's `plistlib` (reliable parsing of nested Apple plist structure)
+- Parses the XML plist directly in Rust via the `plist` crate (no subprocess, no temp file)
 - GPU power can spike to 40W+ under ML/AI workloads (e.g., LM Studio)
 - Thermal pressure levels: Nominal, Light, Moderate, Heavy
 
 ### Dependencies
-- `smc` v0.2 — macOS SMC IOKit access
+- `smc` v0.2 — macOS SMC IOKit access (macOS-only target dependency)
+- `plist` v1 — Apple property-list parsing
 - `tiny_http` — minimal HTTP server for Prometheus scraping
 - `reqwest` — optional HTTP client for direct VM push
-- Python 3 — plist parsing (system Python, no extra deps)

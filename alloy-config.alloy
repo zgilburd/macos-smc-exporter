@@ -2,7 +2,7 @@
 // Grafana Alloy - zm3us (M3 Mac Studio Ultra)
 // Collects host metrics via:
 //   1. prometheus.exporter.unix (CPU, disk, network, thermal)
-//   2. smc-reader (Rust binary: SMC temps, GPU/CPU power from powermetrics)
+//   2. macos-smc-exporter (Rust binary: SMC temps, GPU/CPU power from powermetrics)
 // Forwards all metrics to VictoriaMetrics via HTTPS ingress.
 // =========================================================================
 
@@ -17,7 +17,7 @@ prometheus.scrape "default" {
 }
 
 // --- macOS-specific metrics from Rust exporter ---
-// smc-reader binary serves /metrics on http://localhost:9100
+// macos-smc-exporter binary serves /metrics on http://localhost:9100
 // It reads SMC temperature sensors and powermetrics data
 prometheus.scrape "macos" {
   targets = [{ __address__ = "localhost:9100" }]
